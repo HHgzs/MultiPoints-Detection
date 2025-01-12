@@ -390,6 +390,62 @@ class Annotator:
                     thickness=self.tf,
                     lineType=cv2.LINE_AA,
                 )
+                
+                
+    def multipoints_label(self, points, n_p, label="", color=(128, 128, 128), txt_color=(255, 255, 255), radius=2):
+        txt_color = self.get_txt_color(color, txt_color)
+        if isinstance(points, torch.Tensor):
+            points = points.tolist()
+        if self.pil or not is_ascii(label):
+            p1 = (1e5, 1e5)
+            for i in range(n_p):
+                x1 = points[2*i]
+                x2 = points[2*(i+1)] if 2*(i+1) < len(points) else points[0]
+                y1 = points[2*i+1]
+                y2 = points[2*(i+1)+1] if 2*(i+1)+1 < len(points) else points[1]
+                p1 = (min(p1[0], x1, x2), min(p1[1], y1, y2))
+                self.draw.line([x1, y1, x2, y2], fill=color, width=self.lw)
+                
+            if label:
+                w, h = self.font.getsize(label)  # text width, height
+                outside = p1[1] >= h  # label fits outside box
+                if p1[0] > self.im.size[0] - w:  # size is (w, h), check if label extend beyond right side of image
+                    p1 = self.im.size[0] - w, p1[1]
+                self.draw.rectangle(
+                    (p1[0], p1[1] - h if outside else p1[1], p1[0] + w + 1, p1[1] + 1 if outside else p1[1] + h + 1),
+                    fill=color,
+                )
+                # self.draw.text((box[0], box[1]), label, fill=txt_color, font=self.font, anchor='ls')  # for PIL>8.0
+                self.draw.text((p1[0], p1[1] - h if outside else p1[1]), label, fill=txt_color, font=self.font)
+        else:  # cv2
+            p1 = (1e5, 1e5)
+            for i in range(n_p):
+                x1 = points[2*i]
+                x2 = points[2*(i+1)] if 2*(i+1) < len(points) else points[0]
+                y1 = points[2*i+1]
+                y2 = points[2*(i+1)+1] if 2*(i+1)+1 < len(points) else points[1]
+                p1 = (min(p1[0], x1, x2), min(p1[1], y1, y2))
+                cv2.line(self.im, (x1, y1), (x2, y2), color, self.lw)
+            
+            if label:
+                w, h = cv2.getTextSize(label, 0, fontScale=self.sf, thickness=self.tf)[0]  # text width, height
+                h += 3  # add pixels to pad text
+                outside = p1[1] >= h  # label fits outside box
+                if p1[0] > self.im.shape[1] - w:  # shape is (h, w), check if label extend beyond right side of image
+                    p1 = self.im.shape[1] - w, p1[1]
+                p2 = p1[0] + w, p1[1] - h if outside else p1[1] + h
+                cv2.rectangle(self.im, p1, p2, color, -1, cv2.LINE_AA)  # filled
+                cv2.putText(
+                    self.im,
+                    label,
+                    (p1[0], p1[1] - 2 if outside else p1[1] + h - 1),
+                    0,
+                    self.sf,
+                    txt_color,
+                    thickness=self.tf,
+                    lineType=cv2.LINE_AA,
+                )
+
 
     def masks(self, masks, colors, im_gpu, alpha=0.5, retina_masks=False):
         """
@@ -1010,6 +1066,7 @@ def plot_images(
     batch_idx: Union[torch.Tensor, np.ndarray],
     cls: Union[torch.Tensor, np.ndarray],
     bboxes: Union[torch.Tensor, np.ndarray] = np.zeros(0, dtype=np.float32),
+    multipoints: Union[torch.Tensor, np.ndarray] = np.zeros(0, dtype=np.float32),
     confs: Optional[Union[torch.Tensor, np.ndarray]] = None,
     masks: Union[torch.Tensor, np.ndarray] = np.zeros(0, dtype=np.uint8),
     kpts: Union[torch.Tensor, np.ndarray] = np.zeros((0, 51), dtype=np.float32),
@@ -1055,6 +1112,8 @@ def plot_images(
         cls = cls.cpu().numpy()
     if isinstance(bboxes, torch.Tensor):
         bboxes = bboxes.cpu().numpy()
+    if isinstance(multipoints, torch.Tensor):
+        multipoints = multipoints.cpu().numpy()
     if isinstance(masks, torch.Tensor):
         masks = masks.cpu().numpy().astype(int)
     if isinstance(kpts, torch.Tensor):
@@ -1114,7 +1173,36 @@ def plot_images(
                     if labels or conf[j] > conf_thres:
                         label = f"{c}" if labels else f"{c} {conf[j]:.1f}"
                         annotator.box_label(box, label, color=color, rotated=is_obb)
-
+            
+            elif len(multipoints):
+                points = multipoints[idx]
+                conf = confs[idx] if confs is not None else None  # check for confidence presence (label vs pred)
+                if len(points):
+                    n_p = points.shape[-1] // 2
+                    if points[..., :2*n_p].max() <= 1.01:
+                        points[..., 0::2] *= w  # odd indices (x-coordinates) scale to pixels
+                        points[..., 1::2] *= h  # even indices (y-coordinates) scale to pixels
+                    elif scale < 1:  # absolute coords need scale if image scales
+                        points *= scale
+                
+                points[..., 0::2] += x
+                points[..., 1::2] += y
+                for j, point in enumerate(points.astype(np.int64).tolist()):
+                    c = classes[j]
+                    color = colors(c)
+                    c = names.get(c, c) if names else c
+                    if labels or conf[j] > conf_thres:
+                        label = f"{c}" if labels else f"{c} {conf[j]:.1f}"
+                        annotator.multipoints_label(point, n_p, label, color=color)
+                
+                
+                
+                
+                
+                
+                
+                
+                
             elif len(classes):
                 for c in classes:
                     color = colors(c)
@@ -1173,7 +1261,7 @@ def plot_images(
 
 
 @plt_settings()
-def plot_results(file="path/to/results.csv", dir="", segment=False, pose=False, classify=False, on_plot=None):
+def plot_results(file="path/to/results.csv", dir="", multipoints=False, segment=False, pose=False, classify=False, on_plot=None):
     """
     Plot training results from a results CSV file. The function supports various types of data including segmentation,
     pose estimation, and classification. Plots are saved as 'results.png' in the directory where the CSV is located.

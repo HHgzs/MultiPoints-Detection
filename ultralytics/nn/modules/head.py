@@ -8,14 +8,14 @@ import torch
 import torch.nn as nn
 from torch.nn.init import constant_, xavier_uniform_
 
-from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
+from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors, dist2multipoints
 
-from .block import DFL, BNContrastiveHead, ContrastiveHead, Proto
+from .block import DFL, DFL_MultiPoints, BNContrastiveHead, ContrastiveHead, Proto
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "MultiPointsDetect", "WorldDetect"
 
 
 class Detect(nn.Module):
@@ -133,7 +133,7 @@ class Detect(nn.Module):
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
         m = self  # self.model[-1]  # Detect() module
-        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # cf = torch.bincount(torch.tensor(n_p.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
         # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
         for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
             a[-1].bias.data[:] = 1.0  # box
@@ -171,6 +171,94 @@ class Detect(nn.Module):
         i = torch.arange(batch_size)[..., None]  # batch indices
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
 
+
+class MultiPoints(Detect):
+    """Multi Points head for detection models."""
+
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    format = None  # export format
+    end2end = False  # end2end
+    max_det = 300  # max_det
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+    legacy = False  # backward compatibility for v3/v5/v8/v9 models
+
+
+    def __init__(self, nc=80, n_p=4, ch=()):
+        """Initializes the YOLO detection layer with specified number of classes and channels."""
+        super().__init__(nc, ch)
+        
+        self.reg_max = 32    # 2 times guaranteed positive and negative interval accuracy
+        
+        self.n_p = n_p                              # number of points
+        self.no = nc + self.reg_max * 2 * self.n_p  # number of outputs per anchor
+        
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 2 * self.n_p)), max(ch[0], min(self.nc, 100))  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, self.reg_max * 2 * self.n_p, 1)) for x in ch
+        )
+        self.cv3 = (
+            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+            if self.legacy
+            else nn.ModuleList(
+                nn.Sequential(
+                    nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+                    nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                    nn.Conv2d(c3, self.nc, 1),
+                )
+                for x in ch
+            )
+        )
+        self.dfl = DFL_MultiPoints(self.reg_max, self.n_p) if self.reg_max > 1 else nn.Identity()
+
+    
+    def forward(self, x):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+
+        for i in range(self.nl):
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        if self.training:  # Training path
+            return x
+        y = self._inference(x)
+        return y if self.export else (y, x)
+
+    def decode_multipoints(self, multipoints, anchors, num_points):
+        return dist2multipoints(multipoints, anchors, dim='bpa')
+
+    def _inference(self, x):
+        # Inference path
+        shape = x[0].shape  # BCHW
+        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        if self.format != "imx" and (self.dynamic or self.shape != shape):
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+
+        if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
+            dist = x_cat[:, : self.reg_max * 2 * self.n_p]
+            cls = x_cat[:, self.reg_max * 2 * self.n_p :]
+        else:
+            dist, cls = x_cat.split((self.reg_max * 2 * self.n_p, self.nc), 1)
+
+        if self.export and self.format in {"tflite", "edgetpu"}:
+            # Precompute normalization factor to increase numerical stability
+            # See https://github.com/ultralytics/ultralytics/issues/7371
+            grid_h = shape[2]
+            grid_w = shape[3]
+            grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=dist.device).reshape(1, 4, 1)
+            norm = self.strides / (self.stride[0] * grid_size)
+            multipoints = self.decode_multipoints(self.dfl(dist) * norm, self.anchors.unsqueeze(0) * norm[:, :2], self.n_p)
+            
+        elif self.export and self.format == "imx":
+            multipoints = self.decode_multipoints(
+                self.dfl(dist) * self.strides, self.anchors.unsqueeze(0) * self.strides, self.n_p
+            )
+            return multipoints.transpose(1, 2), cls.sigmoid().permute(0, 2, 1)
+        else:
+            multipoints = self.decode_multipoints(self.dfl(dist), self.anchors.unsqueeze(0), self.n_p) * self.strides
+
+        return torch.cat((multipoints, cls.sigmoid()), 1)
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models."""
@@ -351,7 +439,7 @@ class WorldDetect(Detect):
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
         m = self  # self.model[-1]  # Detect() module
-        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # cf = torch.bincount(torch.tensor(n_p.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
         # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
         for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
             a[-1].bias.data[:] = 1.0  # box

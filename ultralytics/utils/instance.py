@@ -188,12 +188,14 @@ class Instances:
 
     Attributes:
         _bboxes (Bboxes): Internal object for handling bounding box operations.
+        multipoints (list | ndarray): Multipoints array with shape [N, n_points, 2]. Default is None.
         keypoints (ndarray): keypoints(x, y, visible) with shape [N, 17, 3]. Default is None.
         normalized (bool): Flag indicating whether the bounding box coordinates are normalized.
         segments (ndarray): Segments array with shape [N, 1000, 2] after resampling.
 
     Args:
         bboxes (ndarray): An array of bounding boxes with shape [N, 4].
+        multipoints (list | ndarray, optional): A list or array of object multipoints. Default is None.
         segments (list | ndarray, optional): A list or array of object segments. Default is None.
         keypoints (ndarray, optional): An array of keypoints with shape [N, 17, 3]. Default is None.
         bbox_format (str, optional): The format of bounding boxes ('xywh' or 'xyxy'). Default is 'xywh'.
@@ -214,7 +216,7 @@ class Instances:
         This class does not perform input validation, and it assumes the inputs are well-formed.
     """
 
-    def __init__(self, bboxes, segments=None, keypoints=None, bbox_format="xywh", normalized=True) -> None:
+    def __init__(self, bboxes, multipoints=None, segments=None, keypoints=None, bbox_format="xywh", normalized=True) -> None:
         """
         Initialize the object with bounding boxes, segments, and keypoints.
 
@@ -226,6 +228,7 @@ class Instances:
             normalized (bool, optional): Whether the coordinates are normalized. Defaults to True.
         """
         self._bboxes = Bboxes(bboxes=bboxes, format=bbox_format)
+        self.multipoints = multipoints
         self.keypoints = keypoints
         self.normalized = normalized
         self.segments = segments
@@ -246,6 +249,11 @@ class Instances:
             return
         self.segments[..., 0] *= scale_w
         self.segments[..., 1] *= scale_h
+        
+        if self.multipoints is not None:
+            self.multipoints[..., 0] *= scale_w
+            self.multipoints[..., 1] *= scale_h
+
         if self.keypoints is not None:
             self.keypoints[..., 0] *= scale_w
             self.keypoints[..., 1] *= scale_h
@@ -255,6 +263,11 @@ class Instances:
         if not self.normalized:
             return
         self._bboxes.mul(scale=(w, h, w, h))
+        
+        if self.multipoints is not None:
+            self.multipoints[..., 0] *= w
+            self.multipoints[..., 1] *= h
+        
         self.segments[..., 0] *= w
         self.segments[..., 1] *= h
         if self.keypoints is not None:
@@ -269,6 +282,11 @@ class Instances:
         self._bboxes.mul(scale=(1 / w, 1 / h, 1 / w, 1 / h))
         self.segments[..., 0] /= w
         self.segments[..., 1] /= h
+                
+        if self.multipoints is not None:
+            self.multipoints[..., 0] /= w
+            self.multipoints[..., 1] /= h
+        
         if self.keypoints is not None:
             self.keypoints[..., 0] /= w
             self.keypoints[..., 1] /= h
@@ -280,6 +298,11 @@ class Instances:
         self._bboxes.add(offset=(padw, padh, padw, padh))
         self.segments[..., 0] += padw
         self.segments[..., 1] += padh
+        
+        if self.multipoints is not None:
+            self.multipoints[..., 0] += padw
+            self.multipoints[..., 1] += padh
+
         if self.keypoints is not None:
             self.keypoints[..., 0] += padw
             self.keypoints[..., 1] += padh
@@ -300,12 +323,15 @@ class Instances:
             When using boolean indexing, make sure to provide a boolean array with the same
             length as the number of instances.
         """
+        
+        multipoints = self.multipoints[index] if self.multipoints is not None else None
         segments = self.segments[index] if len(self.segments) else self.segments
         keypoints = self.keypoints[index] if self.keypoints is not None else None
         bboxes = self.bboxes[index]
         bbox_format = self._bboxes.format
         return Instances(
             bboxes=bboxes,
+            multipoints=multipoints,
             segments=segments,
             keypoints=keypoints,
             bbox_format=bbox_format,
@@ -322,6 +348,10 @@ class Instances:
         else:
             self.bboxes[:, 1] = h - self.bboxes[:, 1]
         self.segments[..., 1] = h - self.segments[..., 1]
+        
+        if self.multipoints is not None:
+            self.multipoints[..., 1] = h - self.multipoints[..., 1]
+            
         if self.keypoints is not None:
             self.keypoints[..., 1] = h - self.keypoints[..., 1]
 
@@ -335,6 +365,10 @@ class Instances:
         else:
             self.bboxes[:, 0] = w - self.bboxes[:, 0]
         self.segments[..., 0] = w - self.segments[..., 0]
+        
+        if self.multipoints is not None:  
+            self.multipoints[..., 0] = w - self.multipoints[..., 0]
+
         if self.keypoints is not None:
             self.keypoints[..., 0] = w - self.keypoints[..., 0]
 
@@ -348,6 +382,11 @@ class Instances:
             self.convert_bbox(format=ori_format)
         self.segments[..., 0] = self.segments[..., 0].clip(0, w)
         self.segments[..., 1] = self.segments[..., 1].clip(0, h)
+                 
+        if self.multipoints is not None:   
+            self.multipoints[..., 0] = self.multipoints[..., 0].clip(0, w)
+            self.multipoints[..., 1] = self.multipoints[..., 1].clip(0, h)
+            
         if self.keypoints is not None:
             self.keypoints[..., 0] = self.keypoints[..., 0].clip(0, w)
             self.keypoints[..., 1] = self.keypoints[..., 1].clip(0, h)
@@ -357,15 +396,20 @@ class Instances:
         good = self.bbox_areas > 0
         if not all(good):
             self._bboxes = self._bboxes[good]
+            if self.multipoints is not None:
+                self.multipoints = self.multipoints[good]
             if len(self.segments):
                 self.segments = self.segments[good]
             if self.keypoints is not None:
                 self.keypoints = self.keypoints[good]
         return good
 
-    def update(self, bboxes, segments=None, keypoints=None):
+    def update(self, bboxes, multipoints=None, segments=None, keypoints=None):
         """Updates instance variables."""
         self._bboxes = Bboxes(bboxes, format=self._bboxes.format)
+        
+        if multipoints is not None:
+            self.multipoints = multipoints
         if segments is not None:
             self.segments = segments
         if keypoints is not None:
@@ -401,6 +445,7 @@ class Instances:
         if len(instances_list) == 1:
             return instances_list[0]
 
+        use_multipoints = instances_list[0].multipoints is not None
         use_keypoint = instances_list[0].keypoints is not None
         bbox_format = instances_list[0]._bboxes.format
         normalized = instances_list[0].normalized
@@ -420,8 +465,15 @@ class Instances:
             )
         else:
             cat_segments = np.concatenate([b.segments for b in instances_list], axis=axis)
+        
+        
+        cat_multipoints = np.concatenate(
+            [b.multipoints for b in instances_list if b.multipoints.shape[0] > 0]
+            , axis=axis
+        ) if use_multipoints else None
+
         cat_keypoints = np.concatenate([b.keypoints for b in instances_list], axis=axis) if use_keypoint else None
-        return cls(cat_boxes, cat_segments, cat_keypoints, bbox_format, normalized)
+        return cls(cat_boxes, cat_multipoints, cat_segments, cat_keypoints, bbox_format, normalized)
 
     @property
     def bboxes(self):

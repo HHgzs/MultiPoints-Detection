@@ -968,6 +968,7 @@ class RandomPerspective:
 
     Methods:
         affine_transform: Applies affine transformations to the input image.
+        apply_multipoint: Applies affine transformations to multi-points.
         apply_bboxes: Transforms bounding boxes using the affine matrix.
         apply_segments: Transforms segments and generates new bounding boxes.
         apply_keypoints: Transforms keypoints using the affine matrix.
@@ -1181,6 +1182,17 @@ class RandomPerspective:
         out_mask = (xy[:, 0] < 0) | (xy[:, 1] < 0) | (xy[:, 0] > self.size[0]) | (xy[:, 1] > self.size[1])
         visible[out_mask] = 0
         return np.concatenate([xy, visible], axis=-1).reshape(n, nkpt, 3)
+    
+    def apply_multipoints(self, multipoints, M):
+        n, n_p = multipoints.shape[:2]    # (n, n_p, 2)
+        if n == 0:
+            return multipoints
+        xy = np.ones((n * n_p, 3), dtype=multipoints.dtype)
+        xy[:, :2] = multipoints[..., :2].reshape(n * n_p, 2)
+        xy = xy @ M.T  # transform
+        xy = xy[:, :2] / xy[:, 2:3]  # perspective rescale or affine
+
+        return xy.reshape(n, n_p, 2)
 
     def __call__(self, labels):
         """
@@ -1236,15 +1248,20 @@ class RandomPerspective:
 
         bboxes = self.apply_bboxes(instances.bboxes, M)
 
+        multipoints = instances.multipoints
         segments = instances.segments
         keypoints = instances.keypoints
+        
         # Update bboxes if there are segments.
         if len(segments):
             bboxes, segments = self.apply_segments(segments, M)
-
+        if multipoints is not None:
+            multipoints = self.apply_multipoints(multipoints, M)
         if keypoints is not None:
             keypoints = self.apply_keypoints(keypoints, M)
-        new_instances = Instances(bboxes, segments, keypoints, bbox_format="xyxy", normalized=False)
+
+        new_instances = Instances(bboxes, multipoints, segments, keypoints, bbox_format="xyxy", normalized=False)
+        
         # Clip
         new_instances.clip(*self.size)
 
@@ -1907,13 +1924,22 @@ class Albumentations:
                 labels["instances"].convert_bbox("xywh")
                 labels["instances"].normalize(*im.shape[:2][::-1])
                 bboxes = labels["instances"].bboxes
+                multipoints = labels["instances"].multipoints
+                
+                transformed = self.transform(image=im, bboxes=bboxes, class_labels=cls)  # transformed
+                if labels["instances"].multipoints is not None:
+                    n, n_p, _ = multipoints.shape
+                    multipoints = self.transform(image=im, keypoints=multipoints.reshape(-1, 2))["keypoints"]
+                    multipoints = multipoints.reshape(n, n_p, 2)
+
                 # TODO: add supports of segments and keypoints
-                new = self.transform(image=im, bboxes=bboxes, class_labels=cls)  # transformed
-                if len(new["class_labels"]) > 0:  # skip update if no bbox in new im
-                    labels["img"] = new["image"]
-                    labels["cls"] = np.array(new["class_labels"])
-                    bboxes = np.array(new["bboxes"], dtype=np.float32)
-                labels["instances"].update(bboxes=bboxes)
+                if len(transformed["class_labels"]) > 0:  # skip update if no bbox in new im
+                    labels["img"] = transformed["image"]
+                    labels["cls"] = np.array(transformed["class_labels"])
+                    bboxes = np.array(transformed["bboxes"], dtype=np.float32)
+                
+                labels["instances"].update(bboxes=bboxes, multipoints=multipoints)
+                
         else:
             labels["img"] = self.transform(image=labels["img"])["image"]  # transformed
 
@@ -1929,6 +1955,7 @@ class Format:
     Attributes:
         bbox_format (str): Format for bounding boxes. Options are 'xywh' or 'xyxy'.
         normalize (bool): Whether to normalize bounding boxes.
+        return_multipoints (bool): Whether to return multi-points for detection.
         return_mask (bool): Whether to return instance masks for segmentation.
         return_keypoint (bool): Whether to return keypoints for pose estimation.
         return_obb (bool): Whether to return oriented bounding boxes.
@@ -1954,6 +1981,7 @@ class Format:
         self,
         bbox_format="xywh",
         normalize=True,
+        return_multipoints=False,
         return_mask=False,
         return_keypoint=False,
         return_obb=False,
@@ -1961,6 +1989,7 @@ class Format:
         mask_overlap=True,
         batch_idx=True,
         bgr=0.0,
+        n_p=4,
     ):
         """
         Initializes the Format class with given parameters for image and instance annotation formatting.
@@ -1971,6 +2000,7 @@ class Format:
         Args:
             bbox_format (str): Format for bounding boxes. Options are 'xywh', 'xyxy', etc.
             normalize (bool): Whether to normalize bounding boxes to [0,1].
+            return_multipoints (bool): If True, returns multi-points for detection tasks.
             return_mask (bool): If True, returns instance masks for segmentation tasks.
             return_keypoint (bool): If True, returns keypoints for pose estimation tasks.
             return_obb (bool): If True, returns oriented bounding boxes.
@@ -1982,6 +2012,7 @@ class Format:
         Attributes:
             bbox_format (str): Format for bounding boxes.
             normalize (bool): Whether bounding boxes are normalized.
+            return_multipoints (bool): Whether to return multi points.
             return_mask (bool): Whether to return instance masks.
             return_keypoint (bool): Whether to return keypoints.
             return_obb (bool): Whether to return oriented bounding boxes.
@@ -1997,6 +2028,7 @@ class Format:
         """
         self.bbox_format = bbox_format
         self.normalize = normalize
+        self.return_multipoints = return_multipoints
         self.return_mask = return_mask  # set False when training detection only
         self.return_keypoint = return_keypoint
         self.return_obb = return_obb
@@ -2004,6 +2036,7 @@ class Format:
         self.mask_overlap = mask_overlap
         self.batch_idx = batch_idx  # keep the batch indexes
         self.bgr = bgr
+        self.n_p = n_p
 
     def __call__(self, labels):
         """
@@ -2054,6 +2087,18 @@ class Format:
         labels["img"] = self._format_img(img)
         labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl)
         labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
+        
+        if self.return_multipoints:
+            if nl:
+                labels["multipoints"] = torch.from_numpy(instances.multipoints)
+                if self.normalize:
+                    labels["multipoints"][..., 0] /= w
+                    labels["multipoints"][..., 1] /= h
+                labels["multipoints"] = labels["multipoints"].reshape(nl, -1)
+            else:
+                labels["multipoints"] = torch.zeros((nl, self.n_p*2))
+            
+        
         if self.return_keypoint:
             labels["keypoints"] = torch.from_numpy(instances.keypoints)
             if self.normalize:

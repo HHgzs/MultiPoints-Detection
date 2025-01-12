@@ -25,6 +25,7 @@ from .block import (
     C3TR,
     CIB,
     DFL,
+    DFL_MultiPoints,
     ELAN1,
     PSA,
     SPP,
@@ -72,7 +73,7 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
-from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
+from .head import OBB, Classify, Detect, MultiPoints, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
 from .transformer import (
     AIFI,
     MLP,
@@ -105,6 +106,7 @@ __all__ = (
     "MLPBlock",
     "LayerNorm2d",
     "DFL",
+    "DFL_MultiPoints",
     "HGBlock",
     "HGStem",
     "SPP",
@@ -126,6 +128,7 @@ __all__ = (
     "BottleneckCSP",
     "Proto",
     "Detect",
+    "MultiPoints",
     "Segment",
     "Pose",
     "Classify",

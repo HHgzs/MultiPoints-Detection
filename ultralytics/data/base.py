@@ -61,6 +61,7 @@ class BaseDataset(Dataset):
         single_cls=False,
         classes=None,
         fraction=1.0,
+        n_p=4,  # multipoints: number of points
     ):
         """Initialize BaseDataset with given configuration and options."""
         super().__init__()
@@ -78,6 +79,7 @@ class BaseDataset(Dataset):
         self.batch_size = batch_size
         self.stride = stride
         self.pad = pad
+        self.n_p = n_p
         if self.rect:
             assert self.batch_size is not None
             self.set_rectangle()
@@ -285,7 +287,9 @@ class BaseDataset(Dataset):
 
     def __getitem__(self, index):
         """Returns transformed label information for given index."""
-        return self.transforms(self.get_image_and_label(index))
+        image_and_label = self.get_image_and_label(index)
+        transformed = self.transforms(image_and_label)
+        return transformed
 
     def get_image_and_label(self, index):
         """Get and return label information from the dataset."""

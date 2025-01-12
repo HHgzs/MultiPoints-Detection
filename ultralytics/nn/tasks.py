@@ -42,6 +42,7 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
+    MultiPoints,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -68,6 +69,7 @@ from ultralytics.utils.loss import (
     E2EDetectLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
+    v8MultiPointsLoss,
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
@@ -387,6 +389,20 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
+
+class MultiPointsModel(DetectionModel):
+    """YOLOv8 detection model."""
+
+    def __init__(self, cfg="yolov8n.yaml", ch=3, nc=None, verbose=True):  # model, input channels, number of classes
+        """Initialize the YOLOv8 detection model with the given config and parameters."""
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        
+        
+    def init_criterion(self):
+        """Initialize the loss criterion for the DetectionModel."""
+        
+        return v8MultiPointsLoss(self)
 
 
 class OBBModel(DetectionModel):
@@ -939,6 +955,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
     legacy = True  # backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
     nc, act, scales = (d.get(x) for x in ("nc", "activation", "scales"))
+    n_p = d.get("n_p", 0)  # number of points
+    
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     if scales:
         scale = d.get("scale")
@@ -1044,11 +1062,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
+        elif m in {Detect, MultiPoints, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, Segment, Pose, OBB}:
+            if m in {Detect, MultiPoints, Segment, Pose, OBB}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -1136,6 +1154,8 @@ def guess_model_task(model):
             return "pose"
         if m == "obb":
             return "obb"
+        if m == "multipoints":
+            return "multipoints"
 
     # Guess from model cfg
     if isinstance(model, dict):
@@ -1160,6 +1180,8 @@ def guess_model_task(model):
                 return "obb"
             elif isinstance(m, (Detect, WorldDetect, v10Detect)):
                 return "detect"
+            elif isinstance(m, MultiPoints):
+                return "multipoints"
 
     # Guess from model filename
     if isinstance(model, (str, Path)):
@@ -1174,6 +1196,8 @@ def guess_model_task(model):
             return "obb"
         elif "detect" in model.parts:
             return "detect"
+        elif "multipoints" in model.parts:
+            return "multipoints"
 
     # Unable to determine task from model
     LOGGER.warning(

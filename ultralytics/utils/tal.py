@@ -118,12 +118,16 @@ class TaskAlignedAssigner(nn.Module):
         return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
 
     def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
-        """Get in_gts mask, (b, max_num_obj, h*w)."""
+        # Get anchor in gt bbox mask, (b, max_num_obj, h*w)
         mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes)
-        # Get anchor_align metric, (b, max_num_obj, h*w)
+        
+        # Get each anchor iou&class score: align_metric, (b, max_num_obj, h*w)
+        # Get each anchor iou: overlaps, (b, max_num_obj, h*w)
         align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt)
-        # Get topk_metric mask, (b, max_num_obj, h*w)
+        
+        # Get top k anchor with max score on each gt: topk_metric mask, (b, max_num_obj, h*w)
         mask_topk = self.select_topk_candidates(align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool())
+        
         # Merge all mask to a final mask, (b, max_num_obj, h*w)
         mask_pos = mask_topk * mask_in_gts * mask_gt
 
@@ -282,18 +286,112 @@ class TaskAlignedAssigner(nn.Module):
         # Convert (b, n_max_boxes, h*w) -> (b, h*w)
         fg_mask = mask_pos.sum(-2)
         if fg_mask.max() > 1:  # one anchor is assigned to multiple gt_bboxes
-            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).expand(-1, n_max_boxes, -1)  # (b, n_max_boxes, h*w)
+
+            # overlaps: (b, n_max_boxes, h*w) IOU between each anchor and each gt_bbox
+
+            # A mask to indicate whether the anchor is assigned to multiple gt_bboxes: (b, n_max_boxes, h*w)
+            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).expand(-1, n_max_boxes, -1)
+
+            # Find the gt_bboxes with the highest IoU for each anchor: (b, h*w)    
             max_overlaps_idx = overlaps.argmax(1)  # (b, h*w)
 
+            # Use max overlaps idx to update the single gt_bbox assignment
             is_max_overlaps = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)
             is_max_overlaps.scatter_(1, max_overlaps_idx.unsqueeze(1), 1)
 
+            # Update the positive mask
             mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos).float()  # (b, n_max_boxes, h*w)
             fg_mask = mask_pos.sum(-2)
+
         # Find each grid serve which gt(index)
         target_gt_idx = mask_pos.argmax(-2)  # (b, h*w)
         return target_gt_idx, fg_mask, mask_pos
 
+
+class MultiPointsTaskAlignedAssigner(TaskAlignedAssigner):
+    def __init__(self, topk=13, num_classes=80, num_points=4, alpha=1.0, beta=6.0, eps=1e-9):
+        super().__init__(topk, num_classes, alpha, beta, eps)
+        self.num_points = num_points
+    
+    
+    @torch.no_grad()
+    def forward(self, pd_scores, pd_bboxes, pd_multipoints, anc_points, gt_labels, gt_bboxes, gt_multipoints, mask_gt):
+        
+        self.bs = pd_scores.shape[0]
+        self.n_max_boxes = gt_bboxes.shape[1]
+        device = gt_bboxes.device
+
+        if self.n_max_boxes == 0:
+            return (
+                torch.full_like(pd_scores[..., 0], self.bg_idx),
+                torch.zeros_like(pd_bboxes),
+                torch.zeros_like(pd_scores),
+                torch.zeros_like(pd_scores[..., 0]),
+                torch.zeros_like(pd_scores[..., 0]),
+            )
+
+        try:
+            return self._forward(pd_scores, pd_bboxes, pd_multipoints, anc_points, gt_labels, gt_bboxes, gt_multipoints, mask_gt)
+        
+        
+        except torch.OutOfMemoryError:
+            # Move tensors to CPU, compute, then move back to original device
+            LOGGER.warning("WARNING: CUDA OutOfMemoryError in TaskAlignedAssigner, using CPU")
+            cpu_tensors = [t.cpu() for t in (pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)]
+            result = self._forward(*cpu_tensors)
+            return tuple(t.to(device) for t in result)
+ 
+ 
+    def _forward(self, pd_scores, pd_bboxes, pd_multipoints, anc_points, gt_labels, gt_bboxes, gt_multipoints, mask_gt):
+
+        mask_pos, align_metric, overlaps = self.get_pos_mask(
+            pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt
+        )
+
+        target_gt_idx, fg_mask, mask_pos = self.select_highest_overlaps(mask_pos, overlaps, self.n_max_boxes)
+
+        # Assigned target
+        target_labels, target_bboxes, target_multipoints, target_scores = self.get_targets(gt_labels, gt_bboxes, gt_multipoints, target_gt_idx, fg_mask)
+
+        # Normalize
+        align_metric *= mask_pos
+        pos_align_metrics = align_metric.amax(dim=-1, keepdim=True)  # b, max_num_obj
+        pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)  # b, max_num_obj
+        norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
+        target_scores = target_scores * norm_align_metric
+
+        return target_labels, target_bboxes, target_multipoints, target_scores, fg_mask.bool(), target_gt_idx
+    
+
+    def get_targets(self, gt_labels, gt_bboxes, gt_multipoints, target_gt_idx, fg_mask):
+        
+        # Assigned target labels, (b, 1)
+        batch_ind = torch.arange(end=self.bs, dtype=torch.int64, device=gt_labels.device)[..., None]
+        target_gt_idx = target_gt_idx + batch_ind * self.n_max_boxes  # (b, h*w)
+        target_labels = gt_labels.long().flatten()[target_gt_idx]  # (b, h*w)
+
+        # Assigned target boxes, (b, max_num_obj, 4) -> (b, h*w, 4)
+        target_bboxes = gt_bboxes.view(-1, gt_bboxes.shape[-1])[target_gt_idx]
+        target_multipoints = gt_multipoints.view(-1, gt_multipoints.shape[-1])[target_gt_idx]
+
+        # Assigned target scores
+        target_labels.clamp_(0)
+
+        # 10x faster than F.one_hot()
+        target_scores = torch.zeros(
+            (target_labels.shape[0], target_labels.shape[1], self.num_classes),
+            dtype=torch.int64,
+            device=target_labels.device,
+        )  # (b, h*w, 80)
+        target_scores.scatter_(2, target_labels.unsqueeze(-1), 1)
+
+        fg_scores_mask = fg_mask[:, :, None].repeat(1, 1, self.num_classes)  # (b, h*w, 80)
+        target_scores = torch.where(fg_scores_mask > 0, target_scores, 0)
+
+        return target_labels, target_bboxes, target_multipoints, target_scores
+        
+        
+        
 
 class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
     """Assigns ground-truth objects to rotated bounding boxes using a task-aligned metric."""
@@ -356,12 +454,46 @@ def dist2bbox(distance, anchor_points, xywh=True, dim=-1):
         return torch.cat((c_xy, wh), dim)  # xywh bbox
     return torch.cat((x1y1, x2y2), dim)  # xyxy bbox
 
+def dist2multipoints(distance, anchor_points, dim='bap'):
+    """
+    train:
+    distance      ---- (batch, 8400, 8)
+    anchor_points ---- (8400, 2)
+    
+    detect:
+    distance      ---- (batch, 8, anchors)
+    anchor_points ---- (1, 2, anchors)
+    """
+    
+    if dim == 'bap':
+        distance = distance.view(distance.size(0), distance.size(1), 4, 2)                    # (4, 8400, 4, 2)
+        anchor_points_expanded = anchor_points.unsqueeze(0).unsqueeze(2).expand_as(distance)  # (4, 8400, 4, 2)
+        final_points = distance + anchor_points_expanded
+        return final_points.view(distance.size(0), distance.size(1), -1)
+    elif dim == 'bpa':
+        distance = distance.view(distance.size(0), 4, 2, distance.size(2))           # (4, 4, 2, anchors)
+        anchor_points_expanded = anchor_points.unsqueeze(1).expand_as(distance)      # (4, 4, 2, anchors)
+        final_points = distance + anchor_points_expanded
+        return final_points.view(distance.size(0), -1, distance.size(3))
+        
+    
 
 def bbox2dist(anchor_points, bbox, reg_max):
     """Transform bbox(xyxy) to dist(ltrb)."""
     x1y1, x2y2 = bbox.chunk(2, -1)
     return torch.cat((anchor_points - x1y1, x2y2 - anchor_points), -1).clamp_(0, reg_max - 0.01)  # dist (lt, rb)
 
+def multipoints2dist(anchor_points, multipoints, reg_max):
+    batch_size, num_anchors, _ = multipoints.size()
+    num_points = _ // 2
+    
+    multipoints = multipoints.view(batch_size, num_anchors, num_points, 2)
+    anchor_points_expanded = anchor_points.unsqueeze(0).unsqueeze(2).expand_as(multipoints)
+    
+    distances = multipoints - anchor_points_expanded
+    distances = distances.clamp_(-reg_max / 2 + 0.01, reg_max / 2 - 0.01)
+    
+    return distances.view(batch_size, num_anchors, -1)
 
 def dist2rbox(pred_dist, pred_angle, anchor_points, dim=-1):
     """

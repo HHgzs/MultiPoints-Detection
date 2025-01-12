@@ -6,7 +6,8 @@ import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
-from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
+from ultralytics.utils.tal import MultiPointsTaskAlignedAssigner, RotatedTaskAlignedAssigner, TaskAlignedAssigner
+from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors, dist2multipoints, multipoints2dist
 from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_iou, probiou
@@ -113,6 +114,32 @@ class BboxLoss(nn.Module):
         return loss_iou, loss_dfl
 
 
+class MultiPointsLoss(nn.Module):
+    def __init__(self, reg_max=32):
+        """Initialize the MultiPointsLoss module with regularization maximum and DFL settings."""
+        super().__init__()
+        self.reg_max = reg_max
+        self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        
+    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_multipoints, target_scores, target_scores_sum, fg_mask):
+        
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+        # DFL loss
+        if self.dfl_loss:
+            target_dist = multipoints2dist(anchor_points, target_multipoints, self.dfl_loss.reg_max - 1)
+            target_dist = target_dist + (self.reg_max-1)/2
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_dist[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+
+        return loss_iou, loss_dfl
+
+
+                   
 class RotatedBboxLoss(BboxLoss):
     """Criterion class for computing training losses during training."""
 
@@ -252,6 +279,126 @@ class v8DetectionLoss:
             target_bboxes /= stride_tensor
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+
+
+
+class v8MultiPointsLoss():
+    def __init__(self, model, tal_topk=10):  # model must be de-paralleled
+        """Initializes v8DetectionLoss with the model, defining model-related properties and BCE loss function."""
+        device = next(model.parameters()).device  # get model device
+        h = model.args  # hyperparameters
+        m = model.model[-1]  # MultiPoints() module
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.hyp = h
+        self.stride = m.stride  # model strides
+        self.nc = m.nc  # number of classes
+        self.n_p = m.n_p  # number of points
+        self.no = m.nc + m.reg_max * self.n_p * 2
+        self.reg_max = m.reg_max
+        self.device = device
+
+        self.use_dfl = m.reg_max > 1
+
+        self.assigner = MultiPointsTaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, num_points=self.n_p, alpha=0.5, beta=6.0)
+        self.multipoints_loss = MultiPointsLoss(m.reg_max).to(device)
+        
+        # self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        self.proj = torch.linspace((1-m.reg_max)/2, m.reg_max/2, steps=m.reg_max, dtype=torch.float, device=device)
+
+    def preprocess(self, targets, batch_size, bbox_scale_tensor, multipoints_scale_tensor):
+        """Preprocesses the target counts and matches with the input batch size to output a tensor."""
+        nl, ne = targets.shape
+        if nl == 0:
+            out = torch.zeros(batch_size, 0, ne - 1, device=self.device)
+        else:
+            i = targets[:, 0]  # image index
+            _, counts = i.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, counts.max(), ne - 1, device=self.device)
+            for j in range(batch_size):
+                matches = i == j
+                n = matches.sum()
+                if n:
+                    out[j, :n] = targets[matches, 1:]
+            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(bbox_scale_tensor))
+            out[..., 5:] = out[..., 5:].mul_(multipoints_scale_tensor)
+        return out
+
+    def multipoints_decode(self, anchor_points, pred_dist):
+        """Decode predicted object bounding box coordinates from anchor points and distribution."""
+        if self.use_dfl:
+            b, a, c = pred_dist.shape  # batch, anchors, channels
+            pred_dist = pred_dist.view(b, a, self.n_p * 2, c // (self.n_p * 2)).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+        
+        pred_multipoints = dist2multipoints(pred_dist, anchor_points, dim='bap')
+
+        x_min = pred_multipoints[..., ::2].min(-1, keepdim=True)[0]
+        y_min = pred_multipoints[..., 1::2].min(-1, keepdim=True)[0]
+        x_max = pred_multipoints[..., ::2].max(-1, keepdim=True)[0]
+        y_max = pred_multipoints[..., 1::2].max(-1, keepdim=True)[0]
+        
+        pred_bboxes = torch.cat([x_min, y_min, x_max, y_max], dim=-1)
+        
+        return pred_multipoints, pred_bboxes
+
+    def __call__(self, preds, batch):
+        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        feats = preds[1] if isinstance(preds, tuple) else preds
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * self.n_p * 2, self.nc), 1
+        )
+
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        # Targets
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"], batch["multipoints"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, bbox_scale_tensor=imgsz[[1, 0, 1, 0]], multipoints_scale_tensor=imgsz[[1, 0] * self.n_p])
+        gt_labels, gt_bboxes, gt_multipoints = targets.split((1, 4, self.n_p * 2), 2)  # cls, xyxy, 
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+        # Pboxes
+        pred_multipoints, pred_bboxes = self.multipoints_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+        # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
+        # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
+
+        _, target_bboxes, target_multipoints, target_scores, fg_mask, _ = self.assigner(
+            # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            (pred_multipoints.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            gt_multipoints,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+
+        # Cls loss
+        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+        # Bbox loss
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            target_multipoints /= stride_tensor
+            loss[0], loss[2] = self.multipoints_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_multipoints, target_scores, target_scores_sum, fg_mask
             )
 
         loss[0] *= self.hyp.box  # box gain
@@ -743,3 +890,4 @@ class E2EDetectLoss:
         one2one = preds["one2one"]
         loss_one2one = self.one2one(one2one, batch)
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
+
