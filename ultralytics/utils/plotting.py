@@ -420,10 +420,10 @@ class Annotator:
         else:  # cv2
             p1 = (1e5, 1e5)
             for i in range(n_p):
-                x1 = points[2*i]
-                x2 = points[2*(i+1)] if 2*(i+1) < len(points) else points[0]
-                y1 = points[2*i+1]
-                y2 = points[2*(i+1)+1] if 2*(i+1)+1 < len(points) else points[1]
+                x1 = int(points[2*i])
+                x2 = int(points[2*(i+1)] if 2*(i+1) < len(points) else points[0])
+                y1 = int(points[2*i+1])
+                y2 = int(points[2*(i+1)+1] if 2*(i+1)+1 < len(points) else points[1])
                 p1 = (min(p1[0], x1, x2), min(p1[1], y1, y2))
                 cv2.line(self.im, (x1, y1), (x2, y2), color, self.lw)
             

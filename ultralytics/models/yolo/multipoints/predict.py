@@ -20,13 +20,17 @@ class MultiPointsPredictor(BasePredictor):
         ```
     """
 
-    # FIXME: Need a multi-points version of postprocess
     def postprocess(self, preds, img, orig_imgs):
         """Post-processes predictions and returns a list of Results objects."""
+        if not hasattr(self, 'n_p'):
+            m = self.model.model.model[-1]  # last layer
+            self.n_p = m.n_p
+
         preds = ops.multipoints_nms(
             preds,
             self.args.conf,
             self.args.iou,
+            n_p=self.n_p,
             agnostic=self.args.agnostic_nms,
             max_det=self.args.max_det,
             classes=self.args.classes,
@@ -38,5 +42,6 @@ class MultiPointsPredictor(BasePredictor):
         results = []
         for pred, orig_img, img_path in zip(preds, orig_imgs, self.batch[0]):
             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
-            results.append(Results(orig_img, path=img_path, names=self.model.names, boxes=pred))
+            pred[:, 6:6+2*self.n_p] = ops.scale_multipoints(img.shape[2:], pred[:, 6:6+2*self.n_p], orig_img.shape)
+            results.append(Results(orig_img, path=img_path, names=self.model.names, multipoints=pred, n_p=self.n_p))
         return results

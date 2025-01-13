@@ -126,6 +126,24 @@ def scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=None, padding=True, xyw
     boxes[..., :4] /= gain
     return clip_boxes(boxes, img0_shape)
 
+def scale_multipoints(img1_shape, multipoints, img0_shape, ratio_pad=None, padding=True):
+    if ratio_pad is None:
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])
+        pad = (
+            round((img1_shape[1] - img0_shape[1] * gain) / 2 - 0.1),
+            round((img1_shape[0] - img0_shape[0] * gain) / 2 - 0.1),
+        )
+    else:
+        gain = ratio_pad[0][0]
+        pad = ratio_pad[1]
+    
+    if padding:
+        multipoints[..., 0::2] -= pad[0]
+        multipoints[..., 1::2] -= pad[1]
+    multipoints /= gain
+    return clip_multipoints(multipoints, img0_shape)
+    
+
 
 def make_divisible(x, divisor):
     """
@@ -316,34 +334,34 @@ def non_max_suppression(
     return output
 
 
-# FIXME: Need a multi-points version of NMS
 def multipoints_nms(
     prediction,
     conf_thres=0.25,
     iou_thres=0.45,
+    n_p=0,
+    nc=0,
     classes=None,
     agnostic=False,
     multi_label=False,
     labels=(),
     max_det=300,
-    nc=0,  # number of classes (optional)
     max_time_img=0.05,
     max_nms=30000,
-    max_wh=7680,
-    in_place=True,
-    rotated=False,
+    max_wh=7680
 ):
     """
-    Perform non-maximum suppression (NMS) on a set of boxes, with support for masks and multiple labels per box.
+    Perform non-maximum suppression (NMS) on a set of multi-point boxes, with support for masks and multiple labels per box.
 
     Args:
-        prediction (torch.Tensor): A tensor of shape (batch_size, num_classes + 4 + num_masks, num_boxes)
-            containing the predicted boxes, classes, and masks. The tensor should be in the format
+        prediction (torch.Tensor): A tensor of shape (batch_size, num_classes + 2*n_p + num_masks, num_boxes)
+            containing the predicted multi-point boxes, classes, and masks. The tensor should be in the format
             output by a model, such as YOLO.
         conf_thres (float): The confidence threshold below which boxes will be filtered out.
             Valid values are between 0.0 and 1.0.
         iou_thres (float): The IoU threshold below which boxes will be filtered out during NMS.
             Valid values are between 0.0 and 1.0.
+        n_p (int): The number of points in the multi-point boxes.
+        nc (int): The number of classes output by the model.
         classes (List[int]): A list of class indices to consider. If None, all classes will be considered.
         agnostic (bool): If True, the model is agnostic to the number of classes, and all
             classes will be considered as one.
@@ -352,61 +370,55 @@ def multipoints_nms(
             list contains the apriori labels for a given image. The list should be in the format
             output by a dataloader, with each label being a tuple of (class_index, x1, y1, x2, y2).
         max_det (int): The maximum number of boxes to keep after NMS.
-        nc (int, optional): The number of classes output by the model. Any indices after this will be considered masks.
         max_time_img (float): The maximum time (seconds) for processing one image.
         max_nms (int): The maximum number of boxes into torchvision.ops.nms().
         max_wh (int): The maximum box width and height in pixels.
-        in_place (bool): If True, the input prediction tensor will be modified in place.
-        rotated (bool): If Oriented Bounding Boxes (OBB) are being passed for NMS.
 
     Returns:
         (List[torch.Tensor]): A list of length batch_size, where each element is a tensor of
-            shape (num_boxes, 6 + num_masks) containing the kept boxes, with columns
-            (x1, y1, x2, y2, confidence, class, mask1, mask2, ...).
+            shape (num_boxes, 6 + 2*n_p + num_masks) containing the kept boxes, with columns
+            (x1, y1, x2, y2, confidence, class, multipoints, mask1, mask2, ...).
     """
     import torchvision  # scope for faster 'import ultralytics'
 
     # Checks
     assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
     assert 0 <= iou_thres <= 1, f"Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0"
+    assert n_p > 0 or nc > 0, "Number of points and number of classes should be greater than 0"
+    
     if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
         prediction = prediction[0]  # select only inference output
     if classes is not None:
         classes = torch.tensor(classes, device=prediction.device)
 
-    if prediction.shape[-1] == 6:  # end-to-end model (BNC, i.e. 1,300,6)
-        output = [pred[pred[:, 4] > conf_thres][:max_det] for pred in prediction]
-        if classes is not None:
-            output = [pred[(pred[:, 5:6] == classes).any(1)] for pred in output]
-        return output
-
     bs = prediction.shape[0]  # batch size (BCN, i.e. 1,84,6300)
-    nc = nc or (prediction.shape[1] - 4)  # number of classes
-    nm = prediction.shape[1] - nc - 4  # number of masks
-    mi = 4 + nc  # mask start index
-    xc = prediction[:, 4:mi].amax(1) > conf_thres  # candidates
+    if n_p <= 0 and nc > 0:
+        n_p = (prediction.shape[1] - nc)/2
+    elif nc <= 0 and n_p > 0:
+        nc = (prediction.shape[1] - n_p*2)
+    nm = prediction.shape[1] - nc - n_p*2  # number of masks
+    mi = 2*n_p + nc                        # mask start indexs
+    xc = prediction[:, 2*n_p:mi].amax(1) > conf_thres  # candidates
 
     # Settings
     # min_wh = 2  # (pixels) minimum box width and height
     time_limit = 2.0 + max_time_img * bs  # seconds to quit after
     multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
 
-    prediction = prediction.transpose(-1, -2)  # shape(1,84,6300) to shape(1,6300,84)
-    if not rotated:
-        if in_place:
-            prediction[..., :4] = xywh2xyxy(prediction[..., :4])  # xywh to xyxy
-        else:
-            prediction = torch.cat((xywh2xyxy(prediction[..., :4]), prediction[..., 4:]), dim=-1)  # xywh to xyxy
+    prediction = prediction.transpose(-1, -2)    # shape(1,20,6300) to shape(1,6300,20)
+    bbox_prediction = multipoints2xyxy(prediction[..., :2*n_p], n_p) # shape(1,6300, 8)
 
     t = time.time()
-    output = [torch.zeros((0, 6 + nm), device=prediction.device)] * bs
+    output = [torch.zeros((0, 6 + n_p*2 + nm), device=prediction.device)] * bs
     for xi, x in enumerate(prediction):  # image index, image inference
         # Apply constraints
         # x[((x[:, 2:4] < min_wh) | (x[:, 2:4] > max_wh)).any(1), 4] = 0  # width-height
+        
         x = x[xc[xi]]  # confidence
+        box = bbox_prediction[xi][xc[xi]]
 
         # Cat apriori labels if autolabelling
-        if labels and len(labels[xi]) and not rotated:
+        if labels and len(labels[xi]):
             lb = labels[xi]
             v = torch.zeros((len(lb), nc + nm + 4), device=x.device)
             v[:, :4] = xywh2xyxy(lb[:, 1:5])  # box
@@ -418,14 +430,15 @@ def multipoints_nms(
             continue
 
         # Detections matrix nx6 (xyxy, conf, cls)
-        box, cls, mask = x.split((4, nc, nm), 1)
+        # box, cls, mask = x.split((4, nc, nm), 1)
+        multipoints, cls, mask = x.split((2*n_p, nc, nm), 1)
 
         if multi_label:
             i, j = torch.where(cls > conf_thres)
-            x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float(), mask[i]), 1)
+            x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float(), multipoints[i], mask[i]), 1)
         else:  # best class only
             conf, j = cls.max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_thres]
+            x = torch.cat((box, conf, j.float(), multipoints, mask), 1)[conf.view(-1) > conf_thres]
 
         # Filter by class
         if classes is not None:
@@ -441,25 +454,9 @@ def multipoints_nms(
         # Batched NMS
         c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
         scores = x[:, 4]  # scores
-        if rotated:
-            boxes = torch.cat((x[:, :2] + c, x[:, 2:4], x[:, -1:]), dim=-1)  # xywhr
-            i = nms_rotated(boxes, scores, iou_thres)
-        else:
-            boxes = x[:, :4] + c  # boxes (offset by class)
-            i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
+        boxes = x[:, :4] + c  # boxes (offset by class)
+        i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
         i = i[:max_det]  # limit detections
-
-        # # Experimental
-        # merge = False  # use merge-NMS
-        # if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
-        #     # Update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
-        #     from .metrics import box_iou
-        #     iou = box_iou(boxes[i], boxes) > iou_thres  # IoU matrix
-        #     weights = iou * scores[None]  # box weights
-        #     x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
-        #     redundant = True  # require redundant detections
-        #     if redundant:
-        #         i = i[iou.sum(1) > 1]  # require redundancy
 
         output[xi] = x[i]
         if (time.time() - t) > time_limit:
@@ -488,6 +485,15 @@ def clip_boxes(boxes, shape):
         boxes[..., [0, 2]] = boxes[..., [0, 2]].clip(0, shape[1])  # x1, x2
         boxes[..., [1, 3]] = boxes[..., [1, 3]].clip(0, shape[0])  # y1, y2
     return boxes
+
+def clip_multipoints(multipoints, shape):
+    if isinstance(multipoints, torch.Tensor):
+        multipoints[..., 0::2] = multipoints[..., 0::2].clamp(0, shape[1])
+        multipoints[..., 1::2] = multipoints[..., 1::2].clamp(0, shape[0])
+    else:
+        multipoints[..., 0::2] = multipoints[..., 0::2].clip(0, shape[1])
+        multipoints[..., 1::2] = multipoints[..., 1::2].clip(0, shape[0])
+    return multipoints
 
 
 def clip_coords(coords, shape):
@@ -543,6 +549,18 @@ def scale_image(masks, im0_shape, ratio_pad=None):
         masks = masks[:, :, None]
 
     return masks
+
+
+def multipoints2xyxy(multipoints, n_p):
+    if multipoints.shape[-1] != n_p*2:
+        multipoints = multipoints[..., :n_p*2]
+    bbox = multipoints[..., :2*n_p]
+    x_min = bbox[..., 0::2].min(dim=-1, keepdim=True)[0]
+    x_max = bbox[..., 0::2].max(dim=-1, keepdim=True)[0]
+    y_min = bbox[..., 1::2].min(dim=-1, keepdim=True)[0]
+    y_max = bbox[..., 1::2].max(dim=-1, keepdim=True)[0]
+    bbox = torch.cat((x_min, y_min, x_max, y_max), dim=-1)
+    return bbox
 
 
 def xyxy2xywh(x):

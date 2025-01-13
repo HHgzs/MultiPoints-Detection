@@ -228,7 +228,7 @@ class Results(SimpleClass):
     """
 
     def __init__(
-        self, orig_img, path, names, boxes=None, masks=None, probs=None, keypoints=None, obb=None, speed=None
+        self, orig_img, path, names, boxes=None, multipoints=None, masks=None, probs=None, keypoints=None, obb=None, speed=None, n_p=None
     ) -> None:
         """
         Initialize the Results class for storing and manipulating inference results.
@@ -238,6 +238,7 @@ class Results(SimpleClass):
             path (str): The path to the image file.
             names (Dict): A dictionary of class names.
             boxes (torch.Tensor | None): A 2D tensor of bounding box coordinates for each detection.
+            multipoints (torch.Tensor | None): A 2D tensor of multi-point coordinates for each detection.
             masks (torch.Tensor | None): A 3D tensor of detection masks, where each mask is a binary image.
             probs (torch.Tensor | None): A 1D tensor of probabilities of each class for classification task.
             keypoints (torch.Tensor | None): A 2D tensor of keypoint coordinates for each detection.
@@ -260,6 +261,7 @@ class Results(SimpleClass):
         self.orig_img = orig_img
         self.orig_shape = orig_img.shape[:2]
         self.boxes = Boxes(boxes, self.orig_shape) if boxes is not None else None  # native size boxes
+        self.multipoints = Multipoints(multipoints, self.orig_shape, n_p) if multipoints is not None else None  # native size multipoints
         self.masks = Masks(masks, self.orig_shape) if masks is not None else None  # native size or imgsz masks
         self.probs = Probs(probs) if probs is not None else None
         self.keypoints = Keypoints(keypoints, self.orig_shape) if keypoints is not None else None
@@ -268,7 +270,8 @@ class Results(SimpleClass):
         self.names = names
         self.path = path
         self.save_dir = None
-        self._keys = "boxes", "masks", "probs", "keypoints", "obb"
+        self.n_p = n_p
+        self._keys = "boxes", "masks", "probs", "keypoints", "obb", "multipoints"
 
     def __getitem__(self, idx):
         """
@@ -456,6 +459,7 @@ class Results(SimpleClass):
         kpt_line=True,
         labels=True,
         boxes=True,
+        multipoints=True,
         masks=True,
         probs=True,
         show=False,
@@ -501,6 +505,7 @@ class Results(SimpleClass):
         names = self.names
         is_obb = self.obb is not None
         pred_boxes, show_boxes = self.obb if is_obb else self.boxes, boxes
+        pred_multipoints, show_multipoints = self.multipoints, multipoints
         pred_masks, show_masks = self.masks, masks
         pred_probs, show_probs = self.probs, probs
         annotator = Annotator(
@@ -553,6 +558,28 @@ class Results(SimpleClass):
                         True,
                     ),
                     rotated=is_obb,
+                )
+                
+        if pred_multipoints is not None and show_multipoints:
+            for i, d in enumerate(reversed(pred_multipoints)):
+                c, d_conf, id = int(d.cls), float(d.conf) if conf else None, None if d.id is None else int(d.id.item())
+                name = ("" if id is None else f"id:{id} ") + names[c]
+                label = (f"{name} {d_conf:.2f}" if conf else name) if labels else None
+                multipoints = d.multipoints.reshape(-1, 2*self.n_p).squeeze()
+                annotator.multipoints_label(
+                    multipoints,
+                    self.n_p,
+                    label,
+                    color=colors(
+                        c
+                        if color_mode == "class"
+                        else id
+                        if id is not None
+                        else i
+                        if color_mode == "instance"
+                        else None,
+                        True,
+                    ),
                 )
 
         # Plot Classify results
@@ -1083,6 +1110,259 @@ class Boxes(BaseTensor):
             - The tracking IDs are typically used to associate detections across multiple frames in video analysis.
         """
         return self.data[:, -3] if self.is_track else None
+
+    @property
+    @lru_cache(maxsize=2)  # maxsize 1 should suffice
+    def xywh(self):
+        """
+        Convert bounding boxes from [x1, y1, x2, y2] format to [x, y, width, height] format.
+
+        Returns:
+            (torch.Tensor | numpy.ndarray): Boxes in [x_center, y_center, width, height] format, where x_center, y_center are the coordinates of
+                the center point of the bounding box, width, height are the dimensions of the bounding box and the
+                shape of the returned tensor is (N, 4), where N is the number of boxes.
+
+        Examples:
+            >>> boxes = Boxes(torch.tensor([[100, 50, 150, 100], [200, 150, 300, 250]]), orig_shape=(480, 640))
+            >>> xywh = boxes.xywh
+            >>> print(xywh)
+            tensor([[100.0000,  50.0000,  50.0000,  50.0000],
+                    [200.0000, 150.0000, 100.0000, 100.0000]])
+        """
+        return ops.xyxy2xywh(self.xyxy)
+
+    @property
+    @lru_cache(maxsize=2)
+    def xyxyn(self):
+        """
+        Returns normalized bounding box coordinates relative to the original image size.
+
+        This property calculates and returns the bounding box coordinates in [x1, y1, x2, y2] format,
+        normalized to the range [0, 1] based on the original image dimensions.
+
+        Returns:
+            (torch.Tensor | numpy.ndarray): Normalized bounding box coordinates with shape (N, 4), where N is
+                the number of boxes. Each row contains [x1, y1, x2, y2] values normalized to [0, 1].
+
+        Examples:
+            >>> boxes = Boxes(torch.tensor([[100, 50, 300, 400, 0.9, 0]]), orig_shape=(480, 640))
+            >>> normalized = boxes.xyxyn
+            >>> print(normalized)
+            tensor([[0.1562, 0.1042, 0.4688, 0.8333]])
+        """
+        xyxy = self.xyxy.clone() if isinstance(self.xyxy, torch.Tensor) else np.copy(self.xyxy)
+        xyxy[..., [0, 2]] /= self.orig_shape[1]
+        xyxy[..., [1, 3]] /= self.orig_shape[0]
+        return xyxy
+
+    @property
+    @lru_cache(maxsize=2)
+    def xywhn(self):
+        """
+        Returns normalized bounding boxes in [x, y, width, height] format.
+
+        This property calculates and returns the normalized bounding box coordinates in the format
+        [x_center, y_center, width, height], where all values are relative to the original image dimensions.
+
+        Returns:
+            (torch.Tensor | numpy.ndarray): Normalized bounding boxes with shape (N, 4), where N is the
+                number of boxes. Each row contains [x_center, y_center, width, height] values normalized
+                to [0, 1] based on the original image dimensions.
+
+        Examples:
+            >>> boxes = Boxes(torch.tensor([[100, 50, 150, 100, 0.9, 0]]), orig_shape=(480, 640))
+            >>> normalized = boxes.xywhn
+            >>> print(normalized)
+            tensor([[0.1953, 0.1562, 0.0781, 0.1042]])
+        """
+        xywh = ops.xyxy2xywh(self.xyxy)
+        xywh[..., [0, 2]] /= self.orig_shape[1]
+        xywh[..., [1, 3]] /= self.orig_shape[0]
+        return xywh
+
+
+
+
+class Multipoints(BaseTensor):
+    """
+    A class for managing and manipulating detection boxes.
+
+    This class provides functionality for handling detection boxes, including their coordinates, confidence scores,
+    class labels, and optional tracking IDs. It supports various box formats and offers methods for easy manipulation
+    and conversion between different coordinate systems.
+
+    Attributes:
+        data (torch.Tensor | numpy.ndarray): The raw tensor containing detection boxes and associated data.
+        orig_shape (Tuple[int, int]): The original image dimensions (height, width).
+        is_track (bool): Indicates whether tracking IDs are included in the box data.
+        xyxy (torch.Tensor | numpy.ndarray): Boxes in [x1, y1, x2, y2] format.
+        conf (torch.Tensor | numpy.ndarray): Confidence scores for each box.
+        cls (torch.Tensor | numpy.ndarray): Class labels for each box.
+        id (torch.Tensor | numpy.ndarray): Tracking IDs for each box (if available).
+        xywh (torch.Tensor | numpy.ndarray): Boxes in [x, y, width, height] format.
+        xyxyn (torch.Tensor | numpy.ndarray): Normalized [x1, y1, x2, y2] boxes relative to orig_shape.
+        xywhn (torch.Tensor | numpy.ndarray): Normalized [x, y, width, height] boxes relative to orig_shape.
+
+    Methods:
+        cpu(): Returns a copy of the object with all tensors on CPU memory.
+        numpy(): Returns a copy of the object with all tensors as numpy arrays.
+        cuda(): Returns a copy of the object with all tensors on GPU memory.
+        to(*args, **kwargs): Returns a copy of the object with tensors on specified device and dtype.
+
+    Examples:
+        >>> import torch
+        >>> boxes_data = torch.tensor([[100, 50, 150, 100, 0.9, 0], [200, 150, 300, 250, 0.8, 1]])
+        >>> orig_shape = (480, 640)  # height, width
+        >>> boxes = Boxes(boxes_data, orig_shape)
+        >>> print(boxes.xyxy)
+        >>> print(boxes.conf)
+        >>> print(boxes.cls)
+        >>> print(boxes.xywhn)
+    """
+
+    def __init__(self, multipoints, orig_shape, n_p) -> None:
+        """
+        Initialize the Boxes class with detection box data and the original image shape.
+
+        This class manages detection boxes, providing easy access and manipulation of box coordinates,
+        confidence scores, class identifiers, and optional tracking IDs. It supports multiple formats
+        for box coordinates, including both absolute and normalized forms.
+
+        Args:
+            boxes (torch.Tensor | np.ndarray): A tensor or numpy array with detection boxes of shape
+                (num_boxes, 6) or (num_boxes, 7). Columns should contain
+                [x1, y1, x2, y2, confidence, class, (optional) track_id].
+            orig_shape (Tuple[int, int]): The original image shape as (height, width). Used for normalization.
+
+        Attributes:
+            data (torch.Tensor): The raw tensor containing detection boxes and their associated data.
+            orig_shape (Tuple[int, int]): The original image size, used for normalization.
+            is_track (bool): Indicates whether tracking IDs are included in the box data.
+
+        Examples:
+            >>> import torch
+            >>> boxes = torch.tensor([[100, 50, 150, 100, 0.9, 0]])
+            >>> orig_shape = (480, 640)
+            >>> detection_boxes = Boxes(boxes, orig_shape)
+            >>> print(detection_boxes.xyxy)
+            tensor([[100.,  50., 150., 100.]])
+        """
+        
+        if multipoints.ndim == 1:
+            multipoints = multipoints[None, :]
+        n = multipoints.shape[-1]
+        assert n in {6+2*n_p, 7+2*n_p}, f"expected {6+2*n_p} or {7+2*n_p} values but got {n}"  # xyxy, track_id, conf, cls
+        super().__init__(multipoints, orig_shape)
+        self.boxes = Boxes(multipoints[:, :6], orig_shape)
+        self.is_track = n == 7+2*n_p
+        self.orig_shape = orig_shape
+        self.n_p = n_p
+
+    def __getitem__(self, idx):
+        """
+        Returns a new Multipoints instance containing the specified indexed elements of the data tensor.
+
+        Args:
+            idx (int | List[int] | torch.Tensor): Index or indices to select from the data tensor.
+
+        Returns:
+            (Multipoints): A new Multipoints instance containing the indexed data.
+        """
+        return self.__class__(self.data[idx], self.orig_shape, self.n_p)
+
+    @property
+    def xyxy(self):
+        """
+        Returns bounding boxes in [x1, y1, x2, y2] format.
+
+        Returns:
+            (torch.Tensor | numpy.ndarray): A tensor or numpy array of shape (n, 4) containing bounding box
+                coordinates in [x1, y1, x2, y2] format, where n is the number of boxes.
+
+        Examples:
+            >>> results = model("image.jpg")
+            >>> boxes = results[0].boxes
+            >>> xyxy = boxes.xyxy
+            >>> print(xyxy)
+        """
+        return self.data[:, :4]
+
+    @property
+    def conf(self):
+        """
+        Returns the confidence scores for each detection box.
+
+        Returns:
+            (torch.Tensor | numpy.ndarray): A 1D tensor or array containing confidence scores for each detection,
+                with shape (N,) where N is the number of detections.
+
+        Examples:
+            >>> boxes = Boxes(torch.tensor([[10, 20, 30, 40, 0.9, 0]]), orig_shape=(100, 100))
+            >>> conf_scores = boxes.conf
+            >>> print(conf_scores)
+            tensor([0.9000])
+        """
+        return self.data[:, -2-2*self.n_p]
+
+    @property
+    def cls(self):
+        """
+        Returns the class ID tensor representing category predictions for each bounding box.
+
+        Returns:
+            (torch.Tensor | numpy.ndarray): A tensor or numpy array containing the class IDs for each detection box.
+                The shape is (N,), where N is the number of boxes.
+
+        Examples:
+            >>> results = model("image.jpg")
+            >>> boxes = results[0].boxes
+            >>> class_ids = boxes.cls
+            >>> print(class_ids)  # tensor([0., 2., 1.])
+        """
+        return self.data[:, -1-2*self.n_p]
+
+    @property
+    def id(self):
+        """
+        Returns the tracking IDs for each detection box if available.
+
+        Returns:
+            (torch.Tensor | None): A tensor containing tracking IDs for each box if tracking is enabled,
+                otherwise None. Shape is (N,) where N is the number of boxes.
+
+        Examples:
+            >>> results = model.track("path/to/video.mp4")
+            >>> for result in results:
+            ...     boxes = result.boxes
+            ...     if boxes.is_track:
+            ...         track_ids = boxes.id
+            ...         print(f"Tracking IDs: {track_ids}")
+            ...     else:
+            ...         print("Tracking is not enabled for these boxes.")
+
+        Notes:
+            - This property is only available when tracking is enabled (i.e., when `is_track` is True).
+            - The tracking IDs are typically used to associate detections across multiple frames in video analysis.
+        """
+        return self.data[:, -3-2*self.n_p] if self.is_track else None
+    
+    @property
+    def multipoints(self):
+        """
+        Returns the multi-point coordinates for each detection.
+
+        Returns:
+            (torch.Tensor | numpy.ndarray): A tensor or numpy array containing the multi-point coordinates for each
+            detection. The shape is (N, 2*n_p), where N is the number of detections and n_p is the number of points.
+
+        Examples:
+            >>> results = model("path/to/image.jpg")
+            >>> multipoints = results[0].multipoints
+            >>> print(multipoints.shape)  # (N, 2*n_p)
+        """
+        return self.data[:, -2*self.n_p:]
+    
+    
 
     @property
     @lru_cache(maxsize=2)  # maxsize 1 should suffice

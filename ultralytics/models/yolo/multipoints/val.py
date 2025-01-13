@@ -92,10 +92,11 @@ class MultiPointsValidator(BaseValidator):
     # FIXME:
     def postprocess(self, preds):
         """Apply Non-maximum suppression to prediction outputs."""
-        return ops.non_max_suppression(
+        return ops.multipoints_nms(
             preds,
             self.args.conf,
             self.args.iou,
+            n_p=self.n_p,
             labels=self.lb,
             multi_label=True,
             agnostic=self.args.single_cls or self.args.agnostic_nms,
@@ -124,6 +125,9 @@ class MultiPointsValidator(BaseValidator):
         ops.scale_boxes(
             pbatch["imgsz"], predn[:, :4], pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"]
         )  # native-space pred
+        ops.scale_boxes(
+            pbatch["imgsz"], predn[:, 6:6+2*self.n_p], pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"]
+        )
         return predn
 
     def update_metrics(self, preds, batch):
@@ -137,7 +141,7 @@ class MultiPointsValidator(BaseValidator):
                 tp=torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
             )
             pbatch = self._prepare_batch(si, batch)
-            cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
+            cls, bbox, multipoints = pbatch.pop("cls"), pbatch.pop("bbox"), pbatch.pop("multipoints")
             nl = len(cls)
             stat["target_cls"] = cls
             stat["target_img"] = cls.unique()
