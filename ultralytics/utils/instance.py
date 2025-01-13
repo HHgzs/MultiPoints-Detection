@@ -467,11 +467,15 @@ class Instances:
             cat_segments = np.concatenate([b.segments for b in instances_list], axis=axis)
         
         
-        cat_multipoints = np.concatenate(
-            [b.multipoints for b in instances_list if b.multipoints.shape[0] > 0]
-            , axis=axis
-        ) if use_multipoints else None
-
+        if use_multipoints:
+            multipoints_list = [b.multipoints for b in instances_list if b.multipoints.shape[axis] > 0]
+            if len(multipoints_list) > 0:  
+                cat_multipoints = np.concatenate(multipoints_list, axis=axis)
+            else:
+                cat_multipoints = np.zeros((0, instances_list[0].multipoints.shape[-2], instances_list[0].multipoints.shape[-1]), dtype=np.float32)
+        else:
+            cat_multipoints = None
+        
         cat_keypoints = np.concatenate([b.keypoints for b in instances_list], axis=axis) if use_keypoint else None
         return cls(cat_boxes, cat_multipoints, cat_segments, cat_keypoints, bbox_format, normalized)
 
