@@ -9,4 +9,4 @@ from ultralytics import YOLO
 
 
 model = YOLO("ultralytics/cfg/models/11/yolo11-multipoints.yaml").load("main/yolo11n.pt")
-results = model.train(data="ultralytics/cfg/datasets/armor.yaml", epochs=100, imgsz=640, name="multipoints")
+results = model.train(data="ultralytics/cfg/datasets/armor8.yaml", epochs=100, imgsz=640, name="multipoints")

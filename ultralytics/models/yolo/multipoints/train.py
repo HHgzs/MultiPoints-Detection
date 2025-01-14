@@ -53,7 +53,6 @@ class MultiPointsTrainer(yolo.detect.DetectionTrainer):
         return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs, n_p=self.n_p)
 
 
-    # FIXME: Need a multi-points version of plot_images
     def plot_training_samples(self, batch, ni):
         """Creates a plot of training sample images with labels and box coordinates."""
         plot_images(
@@ -66,7 +65,6 @@ class MultiPointsTrainer(yolo.detect.DetectionTrainer):
             on_plot=self.on_plot,
         )
 
-    # FIXME: Need a multi-points version of plot_results
     def plot_metrics(self):
         """Plots training/val metrics."""
         plot_results(file=self.csv, multipoints=True, on_plot=self.on_plot)  # save results.png

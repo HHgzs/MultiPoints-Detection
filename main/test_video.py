@@ -3,7 +3,7 @@ import cv2
 from ultralytics import YOLO
 
 # Load the YOLO model
-model = YOLO("ultralytics/cfg/models/11/yolo11-multipoints.yaml").load("runs/multipoints/multipoints12/weights/last.pt")
+model = YOLO("ultralytics/cfg/models/11/yolo11-multipoints.yaml").load("runs/multipoints/multipoints2/weights/epoch99.pt")
 
 video_path = 'main/test.mp4'
 video_name = video_path.split('/')[-1].split('.')[0]
