@@ -1,6 +1,11 @@
 # MultiPoint-Detection
 
+Install the required packages:
 
+```bash
+pip install -e .
+pip install wandb opencv-python
+```
 
 Train a model to detect multiple points in an image.
 
