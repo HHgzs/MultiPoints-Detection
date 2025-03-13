@@ -17,14 +17,7 @@ pip install -e .
 pip install wandb opencv-python
 ```
 
-### Download the dataset from Baidu Netdisk:
-
-**name**: `armor.tar.gz`
-
-**Link**: https://pan.baidu.com/s/1CatbggCdFp6CnX2_MEcKFg?pwd=4vj3
-
-**Password**: 4vj3 
-
+### Dataset
 
 put the dataset in the following directory:
 
