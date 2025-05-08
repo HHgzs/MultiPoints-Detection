@@ -177,3 +177,4 @@ calibration_*.npy
 
 # test data
 **.mp4
+**/video/

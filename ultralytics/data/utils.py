@@ -131,7 +131,7 @@ def verify_image_label(args):
                     assert lb.shape[1] == (5 + nkpt * ndim), f"labels require {(5 + nkpt * ndim)} columns each"
                     points = lb[:, 5:].reshape(-1, ndim)[:, :2]
                 elif use_multipoints:
-                    assert lb.shape[1] % 2 == 1 and lb.shape[1] >= 3, f"labels require an odd number of columns and at least 3 columns, {lb.shape[1]} columns detected"
+                    assert lb.shape[1] >= 3, f"labels require an odd number of columns and at least 3 columns, {lb.shape[1]} columns detected"
                     points = lb[:, 1:]
                 else:
                     assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"

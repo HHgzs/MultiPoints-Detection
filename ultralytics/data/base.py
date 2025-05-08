@@ -36,6 +36,7 @@ class BaseDataset(Dataset):
         single_cls (bool, optional): If True, single class training is used. Defaults to False.
         classes (list): List of included classes. Default is None.
         fraction (float): Fraction of dataset to utilize. Default is 1.0 (use all data).
+        n_p: int: Number of points for multipoints. Default is 4.
 
     Attributes:
         im_files (list): List of image file paths.
@@ -62,6 +63,8 @@ class BaseDataset(Dataset):
         classes=None,
         fraction=1.0,
         n_p=4,  # multipoints: number of points
+        use_background=False, # Paste the image onto the background for data augmentation
+        background_path=None, # Background image path
     ):
         """Initialize BaseDataset with given configuration and options."""
         super().__init__()
@@ -80,6 +83,15 @@ class BaseDataset(Dataset):
         self.stride = stride
         self.pad = pad
         self.n_p = n_p
+        self.use_background = use_background
+        
+        if self.use_background and background_path is None:
+            raise ValueError(f"{self.prefix}Background path is required when use_background is True.")
+        
+        if self.use_background:
+            self.background_files = self.get_img_files(background_path)
+            self.ni_background = len(self.background_files)
+        
         if self.rect:
             assert self.batch_size is not None
             self.set_rectangle()
@@ -90,7 +102,11 @@ class BaseDataset(Dataset):
 
         # Cache images (options are cache = True, False, None, "ram", "disk")
         self.ims, self.im_hw0, self.im_hw = [None] * self.ni, [None] * self.ni, [None] * self.ni
+        self.background_ims = [None] * self.ni_background if self.use_background else None
         self.npy_files = [Path(f).with_suffix(".npy") for f in self.im_files]
+        if use_background:
+            self.background_npy_files = [Path(f).with_suffix(".npy") for f in self.background_files]
+
         self.cache = cache.lower() if isinstance(cache, str) else "ram" if cache is True else None
         if self.cache == "ram" and self.check_cache_ram():
             if hyp.deterministic:
@@ -160,12 +176,36 @@ class BaseDataset(Dataset):
                 except Exception as e:
                     LOGGER.warning(f"{self.prefix}WARNING ⚠️ Removing corrupt *.npy image file {fn} due to: {e}")
                     Path(fn).unlink(missing_ok=True)
-                    im = cv2.imread(f)  # BGR
+                    if self.use_background:
+                        im = cv2.imread(self.im_files[i], cv2.IMREAD_UNCHANGED) # BGR, transparent
+                    else:
+                        im = cv2.imread(f)  # BGR
+            
             else:  # read image
-                im = cv2.imread(f)  # BGR
+                if self.use_background:
+                    im = cv2.imread(self.im_files[i], cv2.IMREAD_UNCHANGED) # BGR, transparent
+                else:
+                    im = cv2.imread(f)  # BGR
+
             if im is None:
                 raise FileNotFoundError(f"Image Not Found {f}")
-
+            
+            
+            if self.use_background:
+                background_i = random.randint(0, self.ni_background - 1)
+                background_im = self.load_background_image(background_i)
+                background_im = cv2.resize(background_im, (im.shape[1], im.shape[0]), interpolation=cv2.INTER_LINEAR)
+                if im.shape[2] == 4:
+                    b, g, r, alpha = cv2.split(im)
+                    alpha = alpha / 255.0
+                    foreground = cv2.merge((b, g, r))
+                    for c in range(3):
+                        background_im[:, :, c] = (alpha * foreground[:, :, c] + (1 - alpha) * background_im[:, :, c]).astype(np.uint8)
+                    im = background_im
+                else:
+                    LOGGER.warning(f"{self.prefix}WARNING ⚠️ Background image blending failed for image {f}.")
+            
+            
             h0, w0 = im.shape[:2]  # orig hw
             if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
                 r = self.imgsz / max(h0, w0)  # ratio
@@ -187,6 +227,22 @@ class BaseDataset(Dataset):
             return im, (h0, w0), im.shape[:2]
 
         return self.ims[i], self.im_hw0[i], self.im_hw[i]
+    
+    def load_background_image(self, i):
+        background_im, background_npy = self.background_ims[i], self.background_npy_files[i] 
+        if background_im is None:
+            if background_npy.exists():
+                try:
+                    background_im = np.load(background_npy)
+                except Exception as e:
+                    LOGGER.warning(f"{self.prefix}WARNING ⚠️ Removing corrupt *.npy image file {background_npy} due to: {e}")
+                    Path(background_npy).unlink(missing_ok=True)
+                    background_im = cv2.imread(self.background_files[i])
+            else:
+                background_im = cv2.imread(self.background_files[i])
+                if background_im is None:
+                    raise FileNotFoundError(f"Background Image Not Found {self.background_files[i]}")
+        return background_im
 
     def cache_images(self):
         """Cache images to memory or disk."""
@@ -203,12 +259,38 @@ class BaseDataset(Dataset):
                     b += self.ims[i].nbytes
                 pbar.desc = f"{self.prefix}Caching images ({b / gb:.1f}GB {storage})"
             pbar.close()
+            
+        fcn, storage = (self.cache_background_images_to_disk, "Disk") if self.cache == "disk" else (self.load_background_image, "RAM")
+        with ThreadPool(NUM_THREADS) as pool:
+            results = pool.imap(fcn, range(self.ni_background))
+            pbar = TQDM(enumerate(results), total=self.ni_background, disable=LOCAL_RANK > 0)
+            for i, x in pbar:
+                if self.cache == "disk":
+                    b += self.background_npy_files[i].stat().st_size
+                else:
+                    self.background_ims[i] = x
+                    b += self.background_ims[i].nbytes
+                pbar.desc = f"{self.prefix}Caching background images ({b / gb:.1f}GB {storage})"
+            pbar.close()
+        
+        
+        
 
     def cache_images_to_disk(self, i):
         """Saves an image as an *.npy file for faster loading."""
         f = self.npy_files[i]
         if not f.exists():
-            np.save(f.as_posix(), cv2.imread(self.im_files[i]), allow_pickle=False)
+            if self.use_background:
+                np.save(f.as_posix(), cv2.imread(self.im_files[i], cv2.IMREAD_UNCHANGED), allow_pickle=False) # BGR, transparent
+            else:
+                np.save(f.as_posix(), cv2.imread(self.im_files[i]), allow_pickle=False)
+    
+    def cache_background_images_to_disk(self, i):
+        """Saves a background image as an *.npy file for faster loading."""
+        f = self.background_npy_files[i]
+        if not f.exists():
+            np.save(f.as_posix(), cv2.imread(self.background_files[i]), allow_pickle=False)
+
 
     def check_cache_disk(self, safety_margin=0.5):
         """Check image caching requirements vs available disk space."""
@@ -218,7 +300,10 @@ class BaseDataset(Dataset):
         n = min(self.ni, 30)  # extrapolate from 30 random images
         for _ in range(n):
             im_file = random.choice(self.im_files)
-            im = cv2.imread(im_file)
+            if self.use_background:
+                im = cv2.imread(im_file, cv2.IMREAD_UNCHANGED)
+            else:
+                im = cv2.imread(im_file)
             if im is None:
                 continue
             b += im.nbytes
@@ -226,7 +311,7 @@ class BaseDataset(Dataset):
                 self.cache = None
                 LOGGER.info(f"{self.prefix}Skipping caching images to disk, directory not writeable ⚠️")
                 return False
-        disk_required = b * self.ni / n * (1 + safety_margin)  # bytes required to cache dataset to disk
+
         total, used, free = shutil.disk_usage(Path(self.im_files[0]).parent)
         if disk_required > free:
             self.cache = None
@@ -236,6 +321,36 @@ class BaseDataset(Dataset):
                 f"{free / gb:.1f}/{total / gb:.1f}GB free, not caching images to disk ⚠️"
             )
             return False
+        
+        
+        if self.use_background:
+            nb = min(self.ni_background, 30)
+            bb = 0
+            for _ in range(n):
+                bg_file = random.choice(self.background_files)
+                bg = cv2.imread(bg_file)
+                if bg is None:
+                    continue
+                bb += bg.nbytes
+                if not os.access(Path(bg_file).parent, os.W_OK):
+                    self.cache = None
+                    LOGGER.info(f"{self.prefix}Skipping caching background images to disk, directory not writeable ⚠️")
+                    return False
+            disk_required_background = bb * self.ni_background / nb * (1 + safety_margin) # bytes required to cache background images to disk
+        
+        
+        disk_required = b * self.ni / n * (1 + safety_margin)  # bytes required to cache dataset to disk
+        total, used, free = shutil.disk_usage(Path(self.background_files[0]).parent)
+        if disk_required_background > free:
+            self.cache = None
+            LOGGER.info(
+                f"{self.prefix}{disk_required_background / gb:.1f}GB disk space required, "
+                f"with {int(safety_margin * 100)}% safety margin but only "
+                f"{free / gb:.1f}/{total / gb:.1f}GB free, not caching background images to disk ⚠️"
+            )
+            return False
+        
+        
         return True
 
     def check_cache_ram(self, safety_margin=0.5):
@@ -243,12 +358,29 @@ class BaseDataset(Dataset):
         b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
         n = min(self.ni, 30)  # extrapolate from 30 random images
         for _ in range(n):
-            im = cv2.imread(random.choice(self.im_files))  # sample image
+            if self.use_background:
+                im = cv2.imread(random.choice(self.background_files), cv2.IMREAD_UNCHANGED)
+            else:
+                im = cv2.imread(random.choice(self.im_files))  # sample image
             if im is None:
                 continue
             ratio = self.imgsz / max(im.shape[0], im.shape[1])  # max(h, w)  # ratio
             b += im.nbytes * ratio**2
         mem_required = b * self.ni / n * (1 + safety_margin)  # GB required to cache dataset into RAM
+
+        
+        if self.use_background:
+            nb = min(self.ni_background, 30)
+            bb = 0
+            for _ in range(n):
+                bg = cv2.imread(random.choice(self.background_files))
+                if bg is None:
+                    continue
+                ratio = self.imgsz / max(bg.shape[0], bg.shape[1])
+                bb += bg.nbytes * ratio**2
+            mem_required += bb * self.ni_background / nb * (1 + safety_margin)
+            
+        
         mem = psutil.virtual_memory()
         if mem_required > mem.available:
             self.cache = None

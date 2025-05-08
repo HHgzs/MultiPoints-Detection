@@ -8,5 +8,5 @@ from ultralytics import YOLO
 # results = model.train(data="ultralytics/cfg/datasets/coco8.yaml", epochs=100, imgsz=640)
 
 
-model = YOLO("ultralytics/cfg/models/11/yolo11-multipoints-armor.yaml").load("main/yolo11n.pt")
-results = model.train(data="ultralytics/cfg/datasets/armor.yaml", epochs=100, imgsz=640, name="multipoints")
+model = YOLO("ultralytics/cfg/models/11/yolo11-multipoints-rune.yaml").load("main/yolo11n.pt")
+results = model.train(data="ultralytics/cfg/datasets/rune_blender_mini.yaml", epochs=300, imgsz=640, name="rune")

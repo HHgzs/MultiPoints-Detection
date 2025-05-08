@@ -101,6 +101,8 @@ def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, str
         data=data,
         fraction=cfg.fraction if mode == "train" else 1.0,
         n_p=n_p,
+        use_background=True if 'background_path' in data else False,
+        background_path=data.get('background_path', None),
     )
 
 

@@ -8,25 +8,17 @@
 #     └── coco8  ← downloads here (1 MB)
 
 # Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
-path: /home/hhgzs/Project/MultiPoints-Detection/datasets/armor # dataset root dir
+path: /home/hhgzs/Project/MultiPoints-Detection/datasets/rune_blender_mini # dataset root dir
 train: images/train # train images (relative to 'path') 4 images
 val: images/val # val images (relative to 'path') 4 images
 test: # test images (optional)
 
+background_path: /home/hhgzs/Project/MultiPoints-Detection/datasets/armor/images/train
+
 # Classes
 names:
-  0: sentry
-  1: hero
-  2: engineer
-  3: infantry_3
-  4: infantry_4
-  5: infantry_5
-  6: outpost
-  7: base_small
-  8: base_big
-  9: 3_big
-  10: 4_big
-  11: 5_big
+  0: target
+  1: activated
 
 
 # Download script/URL (optional)
