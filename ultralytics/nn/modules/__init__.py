@@ -73,7 +73,7 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
-from .head import OBB, Classify, Detect, MultiPoints, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
+from .head import OBB, Classify, Detect, MultiPointsDFL, MultiPointsDist, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
 from .transformer import (
     AIFI,
     MLP,
@@ -128,7 +128,8 @@ __all__ = (
     "BottleneckCSP",
     "Proto",
     "Detect",
-    "MultiPoints",
+    "MultiPointsDFL", 
+    "MultiPointsDist",
     "Segment",
     "Pose",
     "Classify",

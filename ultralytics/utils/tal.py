@@ -454,7 +454,7 @@ def dist2bbox(distance, anchor_points, xywh=True, dim=-1):
         return torch.cat((c_xy, wh), dim)  # xywh bbox
     return torch.cat((x1y1, x2y2), dim)  # xyxy bbox
 
-def dist2multipoints(distance, anchor_points, dim='bap'):
+def dist2multipoints(distance, anchor_points, dim='bap', n_p=4):
     """
     train:
     distance      ---- (batch, 8400, 8)
@@ -466,12 +466,12 @@ def dist2multipoints(distance, anchor_points, dim='bap'):
     """
     
     if dim == 'bap':
-        distance = distance.view(distance.size(0), distance.size(1), 4, 2)                    # (4, 8400, 4, 2)
+        distance = distance.view(distance.size(0), distance.size(1), n_p, 2)                    # (4, 8400, 4, 2)
         anchor_points_expanded = anchor_points.unsqueeze(0).unsqueeze(2).expand_as(distance)  # (4, 8400, 4, 2)
         final_points = distance + anchor_points_expanded
         return final_points.view(distance.size(0), distance.size(1), -1)
     elif dim == 'bpa':
-        distance = distance.view(distance.size(0), 4, 2, distance.size(2))           # (4, 4, 2, anchors)
+        distance = distance.view(distance.size(0), n_p, 2, distance.size(2))           # (4, 4, 2, anchors)
         anchor_points_expanded = anchor_points.unsqueeze(1).expand_as(distance)      # (4, 4, 2, anchors)
         final_points = distance + anchor_points_expanded
         return final_points.view(distance.size(0), -1, distance.size(3))

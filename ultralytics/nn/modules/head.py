@@ -186,11 +186,11 @@ class MultiPoints(Detect):
     legacy = False  # backward compatibility for v3/v5/v8/v9 models
 
 
-    def __init__(self, nc=80, n_p=4, ch=()):
+    def __init__(self, nc=80, n_p=4, ch=(), reg_max=32):
         """Initializes the YOLO detection layer with specified number of classes and channels."""
         super().__init__(nc, ch)
         
-        self.reg_max = 32    # 2 times guaranteed positive and negative interval accuracy
+        self.reg_max= reg_max  # DFL channels 
         
         self.n_p = n_p                              # number of points
         self.no = nc + self.reg_max * 2 * self.n_p  # number of outputs per anchor
@@ -259,6 +259,17 @@ class MultiPoints(Detect):
             multipoints = self.decode_multipoints(self.dfl(dist), self.anchors.unsqueeze(0), self.n_p) * self.strides
 
         return torch.cat((multipoints, cls.sigmoid()), 1)
+
+
+class MultiPointsDFL(MultiPoints):
+    def __init__(self, nc=80, n_p=4, ch=()):
+        """Initializes the YOLO detection layer with specified number of classes and channels."""
+        super().__init__(nc=nc, n_p=n_p, ch=ch, reg_max=32)
+
+class MultiPointsDist(MultiPoints):
+    def __init__(self, nc=80, n_p=4, ch=()):
+        """Initializes the YOLO detection layer with specified number of classes and channels."""
+        super().__init__(nc=nc, n_p=n_p, ch=ch, reg_max=1)
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models."""

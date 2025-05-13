@@ -350,7 +350,7 @@ class v8MultiPointsLoss():
             b, a, c = pred_dist.shape  # batch, anchors, channels
             pred_dist = pred_dist.view(b, a, self.n_p * 2, c // (self.n_p * 2)).softmax(3).matmul(self.proj.type(pred_dist.dtype))
         
-        pred_multipoints = dist2multipoints(pred_dist, anchor_points, dim='bap')
+        pred_multipoints = dist2multipoints(pred_dist, anchor_points, dim='bap', n_p=self.n_p)
 
         x_min = pred_multipoints[..., ::2].min(-1, keepdim=True)[0]
         y_min = pred_multipoints[..., 1::2].min(-1, keepdim=True)[0]

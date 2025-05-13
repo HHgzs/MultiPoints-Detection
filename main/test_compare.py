@@ -4,16 +4,35 @@ import random
 import cv2
 import numpy as np
 
-n = 10
+n = 5
 image_path = 'datasets/rune_blender/images/train'
 output_folder = 'outputs/rune_blender'
 background_folder = 'datasets/armor/images/train'
+model_path = 'runs/multipoints/rune/weights'
 test_files = []
 
 if not os.path.exists(output_folder):
     os.makedirs(output_folder)
 if background_folder and os.path.exists(background_folder):
     background_files = [f for f in os.listdir(background_folder) if f.endswith('.png') or f.endswith('.jpg')]
+model_files = [f for f in os.listdir(model_path) if f.endswith('.pt')]
+while len(model_files) > 10:
+    if len(model_files) % 2:
+        model_files = model_files[1::2]
+    else:
+        model_files = model_files[::2]
+model_lists = {}
+for model_file in model_files:
+    model_name = model_file.split('.')[0]
+    if 'last' in model_file:
+        continue
+    if 'best' in model_file:
+        continue
+    model_lists[model_name] = YOLO("ultralytics/cfg/models/11/yolo11-multipoints-rune.yaml").load(os.path.join(model_path, model_file))
+if len(model_lists) == 0:
+    print("没有找到模型文件")
+    exit(0)
+
 
 def mix_background(img_path, background_path):
     img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
@@ -61,13 +80,15 @@ elif os.path.isdir(image_path):
                 all_images.append(os.path.join(root, file))
     test_files = random.sample(all_images, min(n, len(all_images)))
 
-model = YOLO("ultralytics/cfg/models/11/yolo11-multipoints-rune.yaml").load("runs/multipoints/rune/weights/last.pt")
-for image_file in test_files:
+
+for i, image_file in enumerate(test_files):
     if background_folder and os.path.exists(background_folder):
         background_file = random.choice(background_files)
         image = mix_background(image_file, os.path.join(background_folder, background_file))
-    result = model.predict(image, conf=0.1)
-    output_path = os.path.join(output_folder, os.path.basename(image_file))
-    result[0].save(output_path)
-    print(f"Processed {image_file} and saved to {output_path}")
+        
+    for j, (model_name, model) in enumerate(model_lists.items()):
+        result = model.predict(image, conf=0.1)
+        output_path = os.path.join(output_folder, f"image_{i+1}_{model_name}.jpg")
+        result[0].save(output_path)
+        print(f"Processed {image_file} and saved to {output_path}")
     

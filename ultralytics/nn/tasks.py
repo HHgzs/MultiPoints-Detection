@@ -42,7 +42,8 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
-    MultiPoints,
+    MultiPointsDFL,
+    MultiPointsDist,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -1062,11 +1063,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, MultiPoints, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
+        elif m in {Detect, MultiPointsDFL, MultiPointsDist, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, MultiPoints, Segment, Pose, OBB}:
+            if m in {Detect, MultiPointsDFL, MultiPointsDist, Segment, Pose, OBB}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -1154,7 +1155,7 @@ def guess_model_task(model):
             return "pose"
         if m == "obb":
             return "obb"
-        if m == "multipoints":
+        if m == "multipointsdist" or m == "multipointsdfl":
             return "multipoints"
 
     # Guess from model cfg
@@ -1180,7 +1181,9 @@ def guess_model_task(model):
                 return "obb"
             elif isinstance(m, (Detect, WorldDetect, v10Detect)):
                 return "detect"
-            elif isinstance(m, MultiPoints):
+            elif isinstance(m, MultiPointsDist):
+                return "multipoints"
+            elif isinstance(m, MultiPointsDFL):
                 return "multipoints"
 
     # Guess from model filename
