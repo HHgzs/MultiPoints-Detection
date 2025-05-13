@@ -97,6 +97,7 @@ warmup_bias_lr: 0.1 # (float) warmup initial bias lr
 box: 5.0 # (float) box loss gain, default=7.5
 cls: 1.0 # (float) cls loss gain (scale with pixels), default=0.5
 dfl: 4.0 # (float) dfl loss gain, default=1.5
+dist: 3.0 # (float) dist loss gain, default=1.0
 pose: 12.0 # (float) pose loss gain
 kobj: 1.0 # (float) keypoint obj loss gain
 nbs: 64 # (int) nominal batch size

@@ -129,6 +129,24 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7
     return iou  # IoU
 
 
+def multipoints_iou(pred_multipoints, target_multipoints):
+    """
+    Calculate the IoU (Intersection over Union) of two polygons. If the vertex order is not in polygon order,
+    construct a convex polygon using the convex hull.
+
+    Args:
+        pred_multipoints (np.ndarray): Array of shape [n_shapes, 2*n_points], where each row represents
+                                       the vertices of a predicted polygon.
+        target_multipoints (np.ndarray): Array of shape [n_shapes, 2*n_points], where each row represents
+                                         the vertices of a target polygon.
+
+    Returns:
+        np.ndarray: Array of IoU values for each pair of polygons, shape [n_shapes].
+    """
+    pass
+    
+    
+
 def mask_iou(mask1, mask2, eps=1e-7):
     """
     Calculate masks IoU.

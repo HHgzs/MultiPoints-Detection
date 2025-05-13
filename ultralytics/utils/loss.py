@@ -10,7 +10,7 @@ from ultralytics.utils.tal import MultiPointsTaskAlignedAssigner, RotatedTaskAli
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors, dist2multipoints, multipoints2dist
 from ultralytics.utils.torch_utils import autocast
 
-from .metrics import bbox_iou, probiou
+from .metrics import bbox_iou, probiou, multipoints_iou
 from .tal import bbox2dist
 
 
@@ -121,10 +121,15 @@ class MultiPointsLoss(nn.Module):
         self.reg_max = reg_max
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
         
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_multipoints, target_scores, target_scores_sum, fg_mask):
+    def forward(self, pred_dist, pred_bboxes, pred_multipoints, anchor_points, target_bboxes, target_multipoints, target_scores, target_scores_sum, fg_mask):
         
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        
+        # TODO
+        # iou = multipoints_iou(pred_multipoints[fg_mask], target_multipoints[fg_mask])
+        
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
@@ -135,8 +140,16 @@ class MultiPointsLoss(nn.Module):
             loss_dfl = loss_dfl.sum() / target_scores_sum
         else:
             loss_dfl = torch.tensor(0.0).to(pred_dist.device)
-
-        return loss_iou, loss_dfl
+            
+        # distance loss
+        # pred_multipoints [batch_size, 8400, n_p*2]    target_multipoints [batch_size, 8400, n_p*2]
+        n_p = pred_multipoints.shape[2] // 2
+        # Only compute distance for foreground mask
+        pred_pts = pred_multipoints[fg_mask].view(-1, n_p, 2)
+        target_pts = target_multipoints[fg_mask].view(-1, n_p, 2)
+        # L1 loss per point, sum over points, mean over objects
+        loss_dist = F.l1_loss(pred_pts, target_pts, reduction='none').sum(-1).mean()
+        return loss_iou, loss_dfl, loss_dist
 
 
                    
@@ -350,7 +363,7 @@ class v8MultiPointsLoss():
 
     def __call__(self, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(4, device=self.device)  # box, cls, dfl, dist
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * self.n_p * 2, self.nc), 1
@@ -397,13 +410,14 @@ class v8MultiPointsLoss():
         if fg_mask.sum():
             target_bboxes /= stride_tensor
             target_multipoints /= stride_tensor
-            loss[0], loss[2] = self.multipoints_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_multipoints, target_scores, target_scores_sum, fg_mask
+            loss[0], loss[2], loss[3] = self.multipoints_loss(
+                pred_distri, pred_bboxes, pred_multipoints, anchor_points, target_bboxes, target_multipoints, target_scores, target_scores_sum, fg_mask
             )
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+        loss[3] *= self.hyp.dist # dist gain
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 

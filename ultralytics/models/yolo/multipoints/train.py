@@ -34,7 +34,7 @@ class MultiPointsTrainer(yolo.detect.DetectionTrainer):
 
     def get_validator(self):
         """Return an instance of SegmentationValidator for validation of YOLO model."""
-        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss", "dist_loss"
         return yolo.multipoints.MultiPointsValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
